@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""
+OpenSpec + Beads Status Display
+
+Shows progress across all OpenSpec changes using Beads for coordination.
+Supports watch mode with Rich Live display and activity history.
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.progress import Progress, BarColumn, TextColumn, TaskProgressColumn
+    from rich.table import Table
+    from rich.text import Text
+    from rich import box
+except ImportError:
+    print("Error: Rich library required. Install with: pip install rich")
+    sys.exit(1)
+
+
+def get_loop_state() -> dict | None:
+    """Read the loop state file if it exists."""
+    for config_dir in [".factory", ".opencode"]:
+        state_file = Path(config_dir) / "openspec-loop.json"
+        if state_file.exists():
+            try:
+                return json.loads(state_file.read_text())
+            except (json.JSONDecodeError, IOError):
+                pass
+    return None
+
+
+def format_elapsed(started_at: str | None) -> str:
+    """Format elapsed time from ISO timestamp."""
+    if not started_at:
+        return "--:--"
+    try:
+        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        delta = datetime.now(start.tzinfo) - start
+        mins, secs = divmod(int(delta.total_seconds()), 60)
+        hours, mins = divmod(mins, 60)
+        if hours > 0:
+            return f"{hours:d}:{mins:02d}:{secs:02d}"
+        return f"{mins:02d}:{secs:02d}"
+    except (ValueError, TypeError):
+        return "--:--"
+
+
+class StatusTracker:
+    """Tracks status changes and maintains history."""
+    
+    def __init__(self, max_history: int = 20):
+        self.history: deque[tuple[datetime, str]] = deque(maxlen=max_history)
+        self.prev_in_progress: set[str] = set()
+        self.prev_ready: set[str] = set()
+        self.prev_blocked: set[str] = set()
+        self.prev_closed: set[str] = set()
+    
+    def update(self, data: dict) -> None:
+        """Compare with previous state and log changes."""
+        now = datetime.now()
+        
+        # Current state
+        in_progress = {t.get("id") for t in data.get("in_progress", [])}
+        ready = {t.get("id") for t in data.get("ready", [])}
+        blocked = {t.get("id") for t in data.get("blocked", [])}
+        
+        # Get closed tasks from epics (tasks with status=closed)
+        closed = set()
+        for epic in data.get("epics", []):
+            if epic.get("status") == "closed":
+                closed.add(epic.get("id"))
+        
+        # Build lookup for titles
+        all_tasks = data.get("in_progress", []) + data.get("ready", []) + data.get("blocked", [])
+        titles = {t.get("id"): t.get("title", "?") for t in all_tasks}
+        for epic in data.get("epics", []):
+            titles[epic.get("id")] = epic.get("title", "?")
+        
+        # Detect changes
+        # Started (moved to in_progress)
+        started = in_progress - self.prev_in_progress
+        for task_id in started:
+            if task_id:
+                title = titles.get(task_id, "?")
+                self.history.append((now, f"[yellow]▶ Started:[/] {task_id} - {title}"))
+        
+        # Completed (was in_progress, now not in any active state)
+        completed = self.prev_in_progress - in_progress - ready - blocked
+        for task_id in completed:
+            if task_id and task_id not in self.prev_closed:
+                self.history.append((now, f"[green]✓ Completed:[/] {task_id}"))
+        
+        # Unblocked (was blocked, now ready)
+        unblocked = (self.prev_blocked & ready) - self.prev_ready
+        for task_id in unblocked:
+            if task_id:
+                title = titles.get(task_id, "?")
+                self.history.append((now, f"[cyan]○ Unblocked:[/] {task_id} - {title}"))
+        
+        # Blocked (newly blocked)
+        newly_blocked = blocked - self.prev_blocked
+        for task_id in newly_blocked:
+            if task_id:
+                title = titles.get(task_id, "?")
+                self.history.append((now, f"[red]● Blocked:[/] {task_id} - {title}"))
+        
+        # Update previous state
+        self.prev_in_progress = in_progress
+        self.prev_ready = ready
+        self.prev_blocked = blocked
+        self.prev_closed = closed
+    
+    def get_history(self) -> list[tuple[datetime, str]]:
+        """Return history entries."""
+        return list(self.history)
+
+
+def run_bd(args: list[str]) -> dict | list | None:
+    """Run a bd command and return parsed JSON output."""
+    try:
+        result = subprocess.run(
+            ["bd"] + args + ["--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        pass
+    return None
+
+
+def check_prerequisites() -> tuple[bool, str]:
+    """Check if bd and .beads exist."""
+    try:
+        subprocess.run(["which", "bd"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False, "bd (Beads) not found. Install with: npm install -g @beads/bd"
+    
+    if not Path(".beads").is_dir():
+        return False, "Beads not initialized. Run: bd init"
+    
+    return True, ""
+
+
+def get_status_data() -> dict:
+    """Fetch all status data from Beads and loop state."""
+    return {
+        "ready": run_bd(["ready"]) or [],
+        "in_progress": run_bd(["list", "--status", "in_progress"]) or [],
+        "blocked": run_bd(["blocked"]) or [],
+        "closed": run_bd(["list", "--status", "closed"]) or [],
+        "epics": run_bd(["list", "--type", "epic"]) or [],
+        "loop_state": get_loop_state(),
+        "timestamp": datetime.now(),
+    }
+
+
+def render_status(data: dict, tracker: StatusTracker | None = None, watch_mode: bool = False) -> Group:
+    """Render the status display as Rich components."""
+    ready = data["ready"]
+    in_progress = data["in_progress"]
+    blocked = data["blocked"]
+    closed = data.get("closed", [])
+    epics = data["epics"]
+    loop_state = data.get("loop_state")
+    timestamp = data["timestamp"]
+    
+    # Build main content
+    content = Text()
+    
+    # Loop state header (if active)
+    if loop_state and loop_state.get("active"):
+        iteration = loop_state.get("iteration", 0)
+        max_iter = loop_state.get("max_iterations", 0)
+        current_task = loop_state.get("current_task", "")
+        started_at = loop_state.get("started_at")
+        
+        content.append("Loop: ", style="bold")
+        content.append("● active", style="green")
+        content.append(f" | Iteration {iteration}", style="white")
+        if max_iter > 0:
+            content.append(f"/{max_iter}", style="dim")
+        if started_at:
+            content.append(f" | Elapsed: {format_elapsed(started_at)}", style="dim")
+        content.append("\n")
+        if current_task:
+            content.append(f"Working on: ", style="dim")
+            content.append(current_task, style="cyan")
+            content.append("\n")
+        content.append("\n")
+    elif loop_state and not loop_state.get("active"):
+        # Loop exists but not active
+        reason = loop_state.get("stuck_reason") or loop_state.get("blocked_reason")
+        content.append("Loop: ", style="bold")
+        content.append("○ stopped", style="dim")
+        if reason:
+            content.append(f" ({reason})", style="yellow")
+        content.append("\n\n")
+    
+    # Progress bar
+    total_tasks = len(ready) + len(in_progress) + len(blocked) + len(closed)
+    if total_tasks > 0:
+        completed_pct = len(closed) / total_tasks * 100
+        bar_width = 30
+        filled = int(bar_width * completed_pct / 100)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        
+        progress_style = "green" if completed_pct == 100 else "yellow" if completed_pct > 50 else "white"
+        content.append("Progress: ", style="dim")
+        content.append(f"[{bar}]", style=progress_style)
+        content.append(f" {len(closed)}/{total_tasks} ({int(completed_pct)}%)", style=progress_style)
+        content.append("\n")
+    
+    # Summary line
+    summary = f"[bold]{len(ready)}[/] ready | [bold]{len(in_progress)}[/] in progress | [bold]{len(blocked)}[/] blocked | [bold]{len(closed)}[/] done"
+    content.append_text(Text.from_markup(summary))
+    content.append("\n")
+    
+    # Epics (Changes)
+    if epics:
+        content.append("\n")
+        content.append_text(Text("Changes (Epics)", style="bold blue"))
+        content.append("\n")
+        for epic in epics:
+            status = epic.get("status", "unknown")
+            style = "green" if status == "closed" else "yellow" if status == "in_progress" else "white"
+            content.append(f"  {epic.get('id', '?')}: ", style="cyan")
+            content.append(f"{epic.get('title', '?')} ", style="white")
+            content.append(f"[{status}]", style=style)
+            content.append("\n")
+    
+    # In Progress
+    if in_progress:
+        content.append("\n")
+        content.append_text(Text("In Progress", style="bold yellow"))
+        content.append("\n")
+        for task in in_progress:
+            assignee = task.get("assignee") or "unassigned"
+            content.append("  ◐ ", style="yellow")
+            content.append(f"{task.get('id', '?')}: ", style="cyan")
+            content.append(f"{task.get('title', '?')} ", style="white")
+            content.append(f"[{assignee}]", style="dim")
+            content.append("\n")
+    
+    # Ready
+    if ready:
+        content.append("\n")
+        content.append_text(Text("Ready (can start)", style="bold green"))
+        content.append("\n")
+        for task in ready[:10]:  # Limit display
+            content.append("  ○ ", style="green")
+            content.append(f"{task.get('id', '?')}: ", style="cyan")
+            content.append(f"{task.get('title', '?')}", style="white")
+            content.append("\n")
+        if len(ready) > 10:
+            content.append(f"  ... and {len(ready) - 10} more\n", style="dim")
+    
+    # Blocked
+    if blocked:
+        content.append("\n")
+        content.append_text(Text("Blocked", style="bold red"))
+        content.append("\n")
+        for task in blocked:
+            blockers = task.get("blockers", [])
+            blocker_str = ", ".join(blockers) if blockers else "unknown"
+            content.append("  ● ", style="red")
+            content.append(f"{task.get('id', '?')}: ", style="cyan")
+            content.append(f"{task.get('title', '?')} ", style="white")
+            content.append(f"(by: {blocker_str})", style="dim")
+            content.append("\n")
+    
+    # Recently Completed (show last 10)
+    if closed:
+        content.append("\n")
+        content.append_text(Text("Recently Completed", style="bold green"))
+        content.append("\n")
+        # Sort by closed_at if available, otherwise just take last 10
+        recent_closed = sorted(
+            closed,
+            key=lambda t: t.get("closed_at", t.get("updated_at", "")),
+            reverse=True
+        )[:10]
+        for task in recent_closed:
+            content.append("  ✓ ", style="green")
+            content.append(f"{task.get('id', '?')}: ", style="cyan")
+            content.append(f"{task.get('title', '?')}", style="dim")
+            closed_at = task.get("closed_at") or task.get("updated_at")
+            if closed_at:
+                # Parse and format timestamp
+                try:
+                    if "T" in str(closed_at):
+                        dt = datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
+                        content.append(f" [{dt.strftime('%H:%M')}]", style="dim")
+                except (ValueError, AttributeError):
+                    pass
+            content.append("\n")
+    
+    # All done message
+    if not ready and not in_progress and not blocked:
+        content.append("\n")
+        if not epics:
+            content.append_text(Text("No work found. Run /openspec-prioritize to import changes.", style="dim"))
+        else:
+            content.append_text(Text("✓ All tasks complete!", style="bold green"))
+        content.append("\n")
+    
+    # Build title
+    title = "OpenSpec + Beads Status"
+    if watch_mode:
+        title += f"  [{timestamp.strftime('%H:%M:%S')}]"
+    
+    subtitle = "[dim]Ctrl+C to exit[/]" if watch_mode else None
+    
+    main_panel = Panel(
+        content,
+        title=title,
+        subtitle=Text.from_markup(subtitle) if subtitle else None,
+        border_style="blue",
+        box=box.DOUBLE,
+        padding=(0, 1),
+    )
+    
+    # History panel (only in watch mode with tracker)
+    if watch_mode and tracker:
+        history = tracker.get_history()
+        if history:
+            history_text = Text()
+            for ts, entry in reversed(history[-10:]):  # Show last 10, newest first
+                history_text.append(f"[{ts.strftime('%H:%M:%S')}] ", style="dim")
+                history_text.append_text(Text.from_markup(entry))
+                history_text.append("\n")
+            
+            history_panel = Panel(
+                history_text,
+                title="Activity",
+                border_style="dim",
+                box=box.ROUNDED,
+                padding=(0, 1),
+            )
+            return Group(main_panel, history_panel)
+    
+    return Group(main_panel)
+
+
+def output_json(data: dict) -> None:
+    """Output status as JSON."""
+    total = len(data["ready"]) + len(data["in_progress"]) + len(data["blocked"]) + len(data.get("closed", []))
+    output = {
+        "ready": data["ready"],
+        "in_progress": data["in_progress"],
+        "blocked": data["blocked"],
+        "closed": data.get("closed", []),
+        "epics": data["epics"],
+        "loop_state": data.get("loop_state"),
+        "summary": {
+            "ready_count": len(data["ready"]),
+            "in_progress_count": len(data["in_progress"]),
+            "blocked_count": len(data["blocked"]),
+            "closed_count": len(data.get("closed", [])),
+            "epic_count": len(data["epics"]),
+            "total_tasks": total,
+            "completion_pct": int(len(data.get("closed", [])) / total * 100) if total > 0 else 0,
+        },
+        "timestamp": data["timestamp"].isoformat(),
+    }
+    print(json.dumps(output, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Show OpenSpec + Beads coordination status"
+    )
+    parser.add_argument(
+        "--json", "-j",
+        action="store_true",
+        help="Output machine-readable JSON"
+    )
+    parser.add_argument(
+        "--watch", "-w",
+        action="store_true",
+        help="Watch mode: refresh display continuously"
+    )
+    parser.add_argument(
+        "--interval", "-i",
+        type=float,
+        default=2.0,
+        help="Refresh interval in seconds (default: 2)"
+    )
+    args = parser.parse_args()
+    
+    console = Console()
+    
+    # Check prerequisites
+    ok, error = check_prerequisites()
+    if not ok:
+        if args.json:
+            print(json.dumps({"error": error}))
+        else:
+            console.print(f"[red]Error:[/] {error}")
+        sys.exit(1)
+    
+    if args.json:
+        data = get_status_data()
+        output_json(data)
+    elif args.watch:
+        tracker = StatusTracker()
+        try:
+            # Initial data
+            data = get_status_data()
+            tracker.update(data)
+            
+            with Live(
+                render_status(data, tracker, watch_mode=True),
+                console=console,
+                refresh_per_second=1,
+                screen=True,
+            ) as live:
+                import time
+                while True:
+                    time.sleep(args.interval)
+                    data = get_status_data()
+                    tracker.update(data)
+                    live.update(render_status(data, tracker, watch_mode=True))
+        except KeyboardInterrupt:
+            pass
+    else:
+        data = get_status_data()
+        console.print(render_status(data, watch_mode=False))
+
+
+if __name__ == "__main__":
+    main()

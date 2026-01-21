@@ -1,0 +1,271 @@
+#!/bin/bash
+# Import OpenSpec changes into Beads as epics with child tasks
+# Usage: openspec-import-beads [--dry-run] [change-id...]
+
+set -euo pipefail
+
+DRY_RUN=false
+CHANGES=()
+MAPPING_FILE=".beads/openspec-mapping.json"
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    --help|-h)
+      echo "Usage: openspec-import-beads [--dry-run] [change-id...]"
+      echo ""
+      echo "Import OpenSpec changes into Beads as epics with child tasks."
+      echo ""
+      echo "Options:"
+      echo "  --dry-run    Show what would be created without making changes"
+      echo "  --help       Show this help"
+      echo ""
+      echo "If no change-ids specified, imports all incomplete changes."
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      CHANGES+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# Check dependencies
+if ! command -v bd >/dev/null 2>&1; then
+  echo "Error: bd (Beads) not found. Install with: npm install -g @beads/bd" >&2
+  exit 1
+fi
+
+if ! command -v openspec >/dev/null 2>&1; then
+  echo "Error: openspec CLI not found" >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: jq not found" >&2
+  exit 1
+fi
+
+# Initialize Beads if needed
+if [[ ! -d ".beads" ]]; then
+  echo "Initializing Beads..."
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[dry-run] Would run: bd init"
+  else
+    bd init
+  fi
+fi
+
+# Get changes to import
+if [[ ${#CHANGES[@]} -eq 0 ]]; then
+  # Get all incomplete changes (macOS compatible - no mapfile)
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && CHANGES+=("$line")
+  done < <(openspec list --json 2>/dev/null | jq -r '.changes[] | select(.status != "complete") | .name')
+fi
+
+if [[ ${#CHANGES[@]} -eq 0 ]]; then
+  echo "No incomplete changes found."
+  exit 0
+fi
+
+echo "Changes to import: ${CHANGES[*]}"
+echo ""
+
+# Load or create mapping file
+if [[ -f "$MAPPING_FILE" ]]; then
+  MAPPING=$(cat "$MAPPING_FILE")
+else
+  MAPPING='{"version":"1","changes":{}}'
+fi
+
+# Parse tasks from tasks.md
+# Returns JSON array of {number, title, indent_level}
+parse_tasks() {
+  local tasks_file="$1"
+  local tasks='[]'
+  
+  if [[ ! -f "$tasks_file" ]]; then
+    echo "$tasks"
+    return
+  fi
+  
+  while IFS= read -r line; do
+    # Match task lines: - [ ] 1.2.3 Task title or - [ ] Task title
+    if [[ "$line" =~ ^[[:space:]]*-[[:space:]]\[.\][[:space:]]+(([0-9]+\.?)+)?[[:space:]]*(.+)$ ]]; then
+      local number="${BASH_REMATCH[1]}"
+      local title="${BASH_REMATCH[3]}"
+      
+      # Count leading spaces for indent level
+      local stripped="${line#"${line%%[![:space:]]*}"}"
+      local indent=$(( (${#line} - ${#stripped}) / 2 ))
+      
+      # Clean up number (remove trailing dot)
+      number="${number%.}"
+      
+      # If no number, generate one based on position
+      if [[ -z "$number" ]]; then
+        local count=$(echo "$tasks" | jq 'length')
+        number="$((count + 1))"
+      fi
+      
+      # Skip already completed tasks
+      if [[ "$line" =~ \[x\] ]]; then
+        continue
+      fi
+      
+      tasks=$(echo "$tasks" | jq --arg num "$number" --arg title "$title" --argjson indent "$indent" \
+        '. + [{"number": $num, "title": $title, "indent": $indent}]')
+    fi
+  done < "$tasks_file"
+  
+  echo "$tasks"
+}
+
+# Import a single change
+import_change() {
+  local change_id="$1"
+  local change_dir="openspec/changes/$change_id"
+  
+  if [[ ! -d "$change_dir" ]]; then
+    echo "Warning: Change directory not found: $change_dir" >&2
+    return 1
+  fi
+  
+  echo "Importing: $change_id"
+  
+  # Check if already imported
+  local existing_epic=$(echo "$MAPPING" | jq -r --arg id "$change_id" '.changes[$id].epic_id // empty')
+  if [[ -n "$existing_epic" ]]; then
+    echo "  Already imported as $existing_epic, checking for new tasks..."
+    import_new_tasks "$change_id" "$existing_epic"
+    return
+  fi
+  
+  # Create epic
+  local description="OpenSpec change: $change_id\nSee $change_dir/"
+  local epic_id
+  
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "  [dry-run] Would create epic: $change_id"
+    epic_id="dry-run-epic"
+  else
+    epic_id=$(bd create "$change_id" -t epic --description "$description" 2>/dev/null | grep -oE '[a-z]+-[a-z0-9]+' | head -1)
+    if [[ -z "$epic_id" ]]; then
+      echo "  Error: Failed to create epic" >&2
+      return 1
+    fi
+    echo "  Created epic: $epic_id"
+  fi
+  
+  # Parse and create tasks
+  local tasks_file="$change_dir/tasks.md"
+  local tasks=$(parse_tasks "$tasks_file")
+  local task_count=$(echo "$tasks" | jq 'length')
+  
+  if [[ "$task_count" -eq 0 ]]; then
+    echo "  No tasks found in $tasks_file"
+  else
+    echo "  Found $task_count tasks"
+    
+    local task_mapping='{}'
+    
+    for i in $(seq 0 $((task_count - 1))); do
+      local task=$(echo "$tasks" | jq ".[$i]")
+      local number=$(echo "$task" | jq -r '.number')
+      local title=$(echo "$task" | jq -r '.title')
+      
+      if [[ "$DRY_RUN" == "true" ]]; then
+        echo "    [dry-run] Would create task: $number - $title"
+        task_mapping=$(echo "$task_mapping" | jq --arg num "$number" --arg id "dry-run-$number" '.[$num] = $id')
+      else
+        local task_id=$(bd create "$title" -t task --parent "$epic_id" 2>/dev/null | grep -oE '[a-z]+-[a-z0-9]+(\.[0-9]+)?' | head -1)
+        if [[ -n "$task_id" ]]; then
+          echo "    Created: $task_id - $title"
+          task_mapping=$(echo "$task_mapping" | jq --arg num "$number" --arg id "$task_id" '.[$num] = $id')
+        else
+          echo "    Warning: Failed to create task: $title" >&2
+        fi
+      fi
+    done
+    
+    # Update mapping
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    MAPPING=$(echo "$MAPPING" | jq --arg id "$change_id" --arg epic "$epic_id" --arg ts "$timestamp" --argjson tasks "$task_mapping" \
+      '.changes[$id] = {"epic_id": $epic, "imported_at": $ts, "tasks": $tasks}')
+  fi
+  
+  echo ""
+}
+
+# Import new tasks for an existing change
+import_new_tasks() {
+  local change_id="$1"
+  local epic_id="$2"
+  local change_dir="openspec/changes/$change_id"
+  local tasks_file="$change_dir/tasks.md"
+  
+  local existing_tasks=$(echo "$MAPPING" | jq -r --arg id "$change_id" '.changes[$id].tasks // {}')
+  local tasks=$(parse_tasks "$tasks_file")
+  local new_count=0
+  
+  for i in $(seq 0 $(($(echo "$tasks" | jq 'length') - 1))); do
+    local task=$(echo "$tasks" | jq ".[$i]")
+    local number=$(echo "$task" | jq -r '.number')
+    local title=$(echo "$task" | jq -r '.title')
+    
+    # Check if already exists
+    local existing=$(echo "$existing_tasks" | jq -r --arg num "$number" '.[$num] // empty')
+    if [[ -n "$existing" ]]; then
+      continue
+    fi
+    
+    ((new_count++))
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+      echo "    [dry-run] Would create new task: $number - $title"
+    else
+      local task_id=$(bd create "$title" -t task --parent "$epic_id" 2>/dev/null | grep -oE '[a-z]+-[a-z0-9]+(\.[0-9]+)?' | head -1)
+      if [[ -n "$task_id" ]]; then
+        echo "    Created new: $task_id - $title"
+        MAPPING=$(echo "$MAPPING" | jq --arg cid "$change_id" --arg num "$number" --arg tid "$task_id" \
+          '.changes[$cid].tasks[$num] = $tid')
+      fi
+    fi
+  done
+  
+  if [[ $new_count -eq 0 ]]; then
+    echo "  No new tasks to import"
+  fi
+}
+
+# Import all changes
+for change_id in "${CHANGES[@]}"; do
+  import_change "$change_id" || true
+done
+
+# Save mapping file
+if [[ "$DRY_RUN" == "true" ]]; then
+  echo "Would save mapping to $MAPPING_FILE:"
+  echo "$MAPPING" | jq .
+else
+  mkdir -p "$(dirname "$MAPPING_FILE")"
+  echo "$MAPPING" | jq . > "$MAPPING_FILE"
+  echo "Saved mapping to $MAPPING_FILE"
+  
+  # Sync beads
+  echo ""
+  echo "Syncing Beads..."
+  bd sync
+fi
+
+echo ""
+echo "Done. Run 'bd ready' to see available tasks."
