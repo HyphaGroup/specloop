@@ -28,11 +28,13 @@ For OpenCode, use `.opencode/scripts/openspec-import-beads` instead.
 1. Checks for `bd` (Beads) and `openspec` CLI
 2. Initializes Beads if `.beads/` doesn't exist
 3. For each incomplete OpenSpec change:
-   - Creates an epic in Beads
+   - Creates an epic in Beads (one epic = one change proposal)
    - Parses `tasks.md` to extract tasks
    - Creates child issues for each task
 4. Saves mapping to `.beads/openspec-mapping.json`
 5. Runs `bd sync` to persist changes
+
+**Multi-agent note:** Each epic represents one change proposal. During execution, only one agent works on an epic at a time - other agents will pick up work from different epics. Set epic-level dependencies to control execution order across changes.
 
 ## Verify Import
 

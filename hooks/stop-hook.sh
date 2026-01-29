@@ -17,7 +17,7 @@ if [[ ! -f "$STATE_FILE" ]]; then
   exit 0
 fi
 
-ACTIVE=$(jq -r '.active // false' "$STATE_FILE")
+ACTIVE=$(jq -r '.active // false' "$STATE_FILE" 2>/dev/null || echo "false")
 if [[ "$ACTIVE" != "true" ]]; then
   exit 0
 fi
@@ -28,6 +28,28 @@ if ! command -v bd >/dev/null 2>&1; then
   jq '.active = false | .stuck_reason = "bd not installed"' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
   exit 0
 fi
+
+# Check if Beads is initialized
+if [[ ! -d ".beads" ]]; then
+  echo "❌ OpenSpec loop: Beads not initialized. Run: bd init" >&2
+  jq '.active = false | .stuck_reason = "Beads not initialized"' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+  exit 0
+fi
+
+# Helper to run bd commands with timeout (cross-platform)
+bd_cmd() {
+  local result
+  # Try gtimeout (macOS with coreutils), then timeout (Linux), then fallback
+  if command -v gtimeout >/dev/null 2>&1; then
+    result=$(gtimeout 10 bd "$@" 2>/dev/null) || result='[]'
+  elif command -v timeout >/dev/null 2>&1; then
+    result=$(timeout 10 bd "$@" 2>/dev/null) || result='[]'
+  else
+    # No timeout available, run directly
+    result=$(bd "$@" 2>/dev/null) || result='[]'
+  fi
+  echo "$result"
+}
 
 # Output summary of all work done in this loop
 output_loop_summary() {
@@ -103,14 +125,14 @@ else
   jq '.stuck_count = 0' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
 fi
 
-# Get Beads status
-READY_TASKS=$(bd ready --json 2>/dev/null || echo '[]')
+# Get Beads status (with timeout)
+READY_TASKS=$(bd_cmd ready --json)
 READY_COUNT=$(echo "$READY_TASKS" | jq 'length')
 
-IN_PROGRESS=$(bd list --status in_progress --json 2>/dev/null || echo '[]')
+IN_PROGRESS=$(bd_cmd list --status in_progress --json)
 IN_PROGRESS_COUNT=$(echo "$IN_PROGRESS" | jq 'length')
 
-EPICS=$(bd list --type epic --json 2>/dev/null || echo '[]')
+EPICS=$(bd_cmd list --type epic --json)
 INCOMPLETE_EPICS=$(echo "$EPICS" | jq '[.[] | select(.status != "closed")] | length')
 
 # Check completion
@@ -121,7 +143,7 @@ if [[ "$READY_COUNT" == "0" ]] && [[ "$IN_PROGRESS_COUNT" == "0" ]]; then
     jq '.active = false' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
     exit 0
   else
-    BLOCKED=$(bd blocked --json 2>/dev/null || echo '[]')
+    BLOCKED=$(bd_cmd blocked --json)
     BLOCKED_COUNT=$(echo "$BLOCKED" | jq 'length')
     if [[ "$BLOCKED_COUNT" -gt 0 ]]; then
       echo "⚠️  OpenSpec loop: $BLOCKED_COUNT tasks blocked, no ready tasks. Stopping." >&2
@@ -131,14 +153,32 @@ if [[ "$READY_COUNT" == "0" ]] && [[ "$IN_PROGRESS_COUNT" == "0" ]]; then
   fi
 fi
 
-# Get next task
-NEXT_TASK=$(echo "$READY_TASKS" | jq -r '.[0] // empty')
-if [[ -z "$NEXT_TASK" ]]; then
-  if [[ "$IN_PROGRESS_COUNT" -gt 0 ]]; then
-    echo "OpenSpec loop: No ready tasks, $IN_PROGRESS_COUNT in progress." >&2
+# Get epics that are in progress (another session is working on them)
+IN_PROGRESS_EPICS=$(bd_cmd list --type epic --status in_progress --json)
+IN_PROGRESS_EPIC_IDS=$(echo "$IN_PROGRESS_EPICS" | jq -r '.[].id // empty' | tr '\n' '|' | sed 's/|$//')
+
+# Filter ready tasks to exclude those from in-progress epics
+if [[ -n "$IN_PROGRESS_EPIC_IDS" ]]; then
+  AVAILABLE_TASKS=$(echo "$READY_TASKS" | jq --arg epics "$IN_PROGRESS_EPIC_IDS" '
+    [.[] | select(.parent as $p | ($epics | split("|") | index($p) | not))]
+  ')
+  FILTERED_COUNT=$(echo "$AVAILABLE_TASKS" | jq 'length')
+  if [[ "$FILTERED_COUNT" == "0" ]] && [[ "$READY_COUNT" != "0" ]]; then
+    echo "OpenSpec loop: $READY_COUNT ready task(s) but all belong to in-progress epics. Skipping." >&2
     exit 0
   fi
-  echo "OpenSpec loop: No work found." >&2
+else
+  AVAILABLE_TASKS="$READY_TASKS"
+fi
+
+# Get next task from available (not in an in-progress epic)
+NEXT_TASK=$(echo "$AVAILABLE_TASKS" | jq -r '.[0] // empty')
+if [[ -z "$NEXT_TASK" ]]; then
+  if [[ "$IN_PROGRESS_COUNT" -gt 0 ]]; then
+    echo "OpenSpec loop: No available tasks, $IN_PROGRESS_COUNT task(s) in progress elsewhere." >&2
+  else
+    echo "OpenSpec loop: No work found." >&2
+  fi
   exit 0
 fi
 
@@ -150,7 +190,7 @@ PARENT_ID=$(echo "$NEXT_TASK" | jq -r '.parent // empty')
 CHANGE_ID=""
 if [[ -n "$PARENT_ID" ]]; then
   # Epic title is the change-id
-  CHANGE_ID=$(bd show "$PARENT_ID" --json 2>/dev/null | jq -r '.title // empty')
+  CHANGE_ID=$(bd_cmd show "$PARENT_ID" --json | jq -r '.title // empty')
 fi
 
 # Update state
@@ -177,8 +217,9 @@ Guardrails:
 - Refer to openspec/AGENTS.md if conventions are unclear.
 
 Steps:
-1. Claim the task in Beads:
+1. Claim the task AND epic in Beads (prevents other agents from working on this change):
    \`\`\`bash
+   bd update $PARENT_ID --status in_progress  # Mark epic in progress
    bd update $TASK_ID --status in_progress
    bd sync
    \`\`\`

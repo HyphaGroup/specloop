@@ -62,12 +62,15 @@ If incomplete changes exist but not in Beads, run `/openspec-prioritize` to impo
 When you find a ready task:
 
 ```bash
-# Claim the task
-bd update <task-id> --status in_progress --assignee $(hostname)-$$
+# Claim the epic AND task (prevents other agents from working on this change)
+bd update <epic-id> --status in_progress   # Mark epic in progress first
+bd update <task-id> --status in_progress
 
 # Sync claim to git so other agents see it
 bd sync
 ```
+
+**Note:** Only one agent works on an epic at a time. Other agents will skip to different epics that aren't in progress.
 
 **Step 4: Execute Task**
 
@@ -153,7 +156,10 @@ npm test && npm run lint
 **Stop Behavior:**
 
 When you try to stop, the stop hook checks Beads:
-- If `bd ready` has tasks → continues you on next task
+- If `bd ready` has tasks from a non-in-progress epic → continues you on next task
+- If all ready tasks belong to epics already in progress (another agent working) → allows stop
 - If all work done → allows stop
+
+**Multi-agent coordination:** The hook filters out tasks from in-progress epics, allowing multiple agents to work in parallel on different epics without interfering.
 
 To cancel: delete `.factory/openspec-loop.json` or run `/openspec-cancel-loop`.

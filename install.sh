@@ -18,7 +18,7 @@ VERBOSE=false
 UNINSTALL=false
 SKIP_DEPS=false
 TARGET=""
-PLATFORM=""  # "droid" or "opencode" - auto-detected or specified
+PLATFORM=""  # "droid", "opencode", or "both" - auto-detected or specified
 
 # Platform-specific directory names
 # Droid:    .factory/commands, .factory/skills, .factory/hooks, ~/.factory
@@ -51,6 +51,10 @@ while [[ $# -gt 0 ]]; do
       PLATFORM="opencode"
       shift
       ;;
+    --both)
+      PLATFORM="both"
+      shift
+      ;;
     --help|-h)
       echo "Usage: $0 [TARGET_DIR] [OPTIONS]"
       echo ""
@@ -60,8 +64,9 @@ while [[ $# -gt 0 ]]; do
       echo "  TARGET_DIR    Target project directory (default: current directory)"
       echo ""
       echo "Options:"
-      echo "  --droid       Force installation for Factory Droid (.factory/)"
-      echo "  --opencode    Force installation for OpenCode (.opencode/)"
+      echo "  --droid       Install for Factory Droid (.factory/)"
+      echo "  --opencode    Install for OpenCode (.opencode/)"
+      echo "  --both        Install for both platforms"
       echo "  --dry-run     Show what would be done without making changes"
       echo "  --verbose     Show detailed output"
       echo "  --uninstall   Remove installation from target"
@@ -75,9 +80,9 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Examples:"
       echo "  $0 .                    # Install in current directory (auto-detect platform)"
-      echo "  $0 . --opencode         # Install for OpenCode specifically"
+      echo "  $0 . --both             # Install for both Droid and OpenCode"
+      echo "  $0 . --opencode         # Install for OpenCode only"
       echo "  $0 ~/.factory --droid   # Install globally for Droid"
-      echo "  $0 ~/.config/opencode --opencode  # Install globally for OpenCode"
       echo "  $0 . --dry-run          # Preview what would be installed"
       echo "  $0 . --uninstall        # Remove installation"
       exit 0
@@ -351,13 +356,21 @@ unconfigure_hooks() {
   log "Removed Stop hook from settings.json"
 }
 
-# Uninstall
-do_uninstall() {
-  detect_platform
+# Uninstall for a single platform, returns count of removed items
+uninstall_for_platform() {
+  local plat="$1"
+  local removed=0
   
-  local CONFIG_DIR="$(get_config_dir)"
-  local COMMANDS_DIR="$(get_commands_dir)"
-  local SKILLS_DIR="$(get_skills_dir)"
+  local CONFIG_DIR COMMANDS_DIR SKILLS_DIR
+  if [[ "$plat" == "opencode" ]]; then
+    CONFIG_DIR=".opencode"
+    COMMANDS_DIR="command"
+    SKILLS_DIR="skill"
+  else
+    CONFIG_DIR=".factory"
+    COMMANDS_DIR="commands"
+    SKILLS_DIR="skills"
+  fi
   
   # Determine install base
   local INSTALL_BASE="$TARGET/$CONFIG_DIR"
@@ -365,10 +378,15 @@ do_uninstall() {
     INSTALL_BASE="$TARGET"
   fi
   
-  echo -e "${BLUE}Uninstalling from:${NC} $INSTALL_BASE (platform: $PLATFORM)"
-  echo ""
+  # Check if config dir exists
+  if [[ ! -d "$INSTALL_BASE" ]]; then
+    log "No $CONFIG_DIR directory found, skipping $plat"
+    echo "$removed"
+    return
+  fi
   
-  local removed=0
+  echo -e "${BLUE}Uninstalling from:${NC} $INSTALL_BASE (platform: $plat)"
+  echo ""
   
   for cmd in openspec-apply-loop.md openspec-prioritize.md openspec-cancel-loop.md openspec-status.md; do
     local file="$INSTALL_BASE/$COMMANDS_DIR/$cmd"
@@ -406,7 +424,19 @@ do_uninstall() {
     ((removed++)) || true
   fi
   
-
+  # Remove scripts
+  for script in openspec-status openspec-import-beads; do
+    local script_file="$INSTALL_BASE/scripts/$script"
+    if [[ -f "$script_file" ]]; then
+      if [[ "$DRY_RUN" == "true" ]]; then
+        echo "Would remove: scripts/$script"
+      else
+        rm -f "$script_file"
+        success "Removed: scripts/$script"
+      fi
+      ((removed++)) || true
+    fi
+  done
   
   # Remove skills (directories)
   for skill in openspec-bootstrap; do
@@ -434,7 +464,7 @@ do_uninstall() {
   done
   
   # Platform-specific cleanup
-  if [[ "$PLATFORM" == "droid" ]]; then
+  if [[ "$plat" == "droid" ]]; then
     unconfigure_hooks "$INSTALL_BASE"
   else
     # Remove OpenCode plugin
@@ -450,8 +480,27 @@ do_uninstall() {
     fi
   fi
   
+  echo "$removed"
+}
+
+# Main uninstall
+do_uninstall() {
+  detect_platform
+  
+  local total_removed=0
+  
+  if [[ "$PLATFORM" == "both" ]]; then
+    local droid_removed opencode_removed
+    droid_removed=$(uninstall_for_platform "droid")
+    echo ""
+    opencode_removed=$(uninstall_for_platform "opencode")
+    total_removed=$((droid_removed + opencode_removed))
+  else
+    total_removed=$(uninstall_for_platform "$PLATFORM")
+  fi
+  
   echo ""
-  if [[ $removed -eq 0 ]]; then
+  if [[ $total_removed -eq 0 ]]; then
     echo "Nothing to uninstall."
   elif [[ "$DRY_RUN" == "true" ]]; then
     echo -e "${YELLOW}Dry run complete. Use without --dry-run to actually uninstall.${NC}"
@@ -460,13 +509,20 @@ do_uninstall() {
   fi
 }
 
-# Main install
-do_install() {
-  detect_platform
+# Install for a single platform
+install_for_platform() {
+  local plat="$1"
   
-  local CONFIG_DIR="$(get_config_dir)"
-  local COMMANDS_DIR="$(get_commands_dir)"
-  local SKILLS_DIR="$(get_skills_dir)"
+  local CONFIG_DIR COMMANDS_DIR SKILLS_DIR
+  if [[ "$plat" == "opencode" ]]; then
+    CONFIG_DIR=".opencode"
+    COMMANDS_DIR="command"
+    SKILLS_DIR="skill"
+  else
+    CONFIG_DIR=".factory"
+    COMMANDS_DIR="commands"
+    SKILLS_DIR="skills"
+  fi
   
   # Determine install base
   local INSTALL_BASE="$TARGET/$CONFIG_DIR"
@@ -474,15 +530,13 @@ do_install() {
     INSTALL_BASE="$TARGET"
   fi
   
-  echo -e "${BLUE}Installing to:${NC} $INSTALL_BASE (platform: $PLATFORM)"
+  echo -e "${BLUE}Installing to:${NC} $INSTALL_BASE (platform: $plat)"
   echo ""
-  
-  check_deps
   
   if [[ "$DRY_RUN" == "false" ]]; then
     mkdir -p "$INSTALL_BASE/$COMMANDS_DIR" "$INSTALL_BASE/$SKILLS_DIR"
     # Only create hooks dir for Droid
-    if [[ "$PLATFORM" == "droid" ]]; then
+    if [[ "$plat" == "droid" ]]; then
       mkdir -p "$INSTALL_BASE/hooks"
     fi
     log "Created directories"
@@ -521,7 +575,7 @@ do_install() {
   done
   
   # Install hook script (Droid) or plugin (OpenCode)
-  if [[ "$PLATFORM" == "droid" ]]; then
+  if [[ "$plat" == "droid" ]]; then
     local hook_dest="$INSTALL_BASE/hooks/openspec-stop-hook.sh"
     if [[ "$DRY_RUN" == "true" ]]; then
       echo "Would install: hooks/openspec-stop-hook.sh"
@@ -567,31 +621,64 @@ do_install() {
   
   # Configure hooks (Droid) or note about plugin (OpenCode)
   echo ""
-  if [[ "$PLATFORM" == "droid" ]]; then
+  if [[ "$plat" == "droid" ]]; then
     configure_hooks "$INSTALL_BASE"
   else
     success "OpenCode plugin installed for session.idle event handling"
     echo "  The loop will auto-continue when the session becomes idle."
   fi
+}
+
+# Main install
+do_install() {
+  detect_platform
+  check_deps
   
-  echo ""
-  if [[ "$DRY_RUN" == "true" ]]; then
-    echo -e "${YELLOW}Dry run complete. Use without --dry-run to actually install.${NC}"
-  else
-    echo -e "${GREEN}Installation complete!${NC} (platform: $PLATFORM)"
+  if [[ "$PLATFORM" == "both" ]]; then
+    install_for_platform "droid"
     echo ""
-    echo "Available commands:"
-    echo "  /openspec-prioritize  - Create priority queue for changes"
-    echo "  /openspec-apply-loop  - Start the loop"
-    echo "  /openspec-cancel-loop - Cancel the loop"
+    echo "---"
     echo ""
-    echo "Available skills:"
-    echo "  openspec-bootstrap    - Bootstrap new project for OpenSpec"
+    install_for_platform "opencode"
+    
     echo ""
-    if [[ "$PLATFORM" == "droid" ]]; then
-      echo "Restart droid to pick up the new configuration."
+    if [[ "$DRY_RUN" == "true" ]]; then
+      echo -e "${YELLOW}Dry run complete. Use without --dry-run to actually install.${NC}"
     else
-      echo "Restart opencode to pick up the new configuration."
+      echo -e "${GREEN}Installation complete for both platforms!${NC}"
+      echo ""
+      echo "Available commands:"
+      echo "  /openspec-prioritize  - Create priority queue for changes"
+      echo "  /openspec-apply-loop  - Start the loop"
+      echo "  /openspec-cancel-loop - Cancel the loop"
+      echo ""
+      echo "Available skills:"
+      echo "  openspec-bootstrap    - Bootstrap new project for OpenSpec"
+      echo ""
+      echo "Restart droid/opencode to pick up the new configuration."
+    fi
+  else
+    install_for_platform "$PLATFORM"
+    
+    echo ""
+    if [[ "$DRY_RUN" == "true" ]]; then
+      echo -e "${YELLOW}Dry run complete. Use without --dry-run to actually install.${NC}"
+    else
+      echo -e "${GREEN}Installation complete!${NC} (platform: $PLATFORM)"
+      echo ""
+      echo "Available commands:"
+      echo "  /openspec-prioritize  - Create priority queue for changes"
+      echo "  /openspec-apply-loop  - Start the loop"
+      echo "  /openspec-cancel-loop - Cancel the loop"
+      echo ""
+      echo "Available skills:"
+      echo "  openspec-bootstrap    - Bootstrap new project for OpenSpec"
+      echo ""
+      if [[ "$PLATFORM" == "droid" ]]; then
+        echo "Restart droid to pick up the new configuration."
+      else
+        echo "Restart opencode to pick up the new configuration."
+      fi
     fi
   fi
 }
