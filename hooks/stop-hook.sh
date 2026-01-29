@@ -57,6 +57,48 @@ bd_cmd() {
   echo "$result"
 }
 
+# Sync completed Beads tasks back to tasks.md files
+sync_completed_tasks() {
+  # Get all closed tasks
+  local closed_tasks=$(bd_cmd list --status closed --type task --json)
+  local count=$(echo "$closed_tasks" | jq 'length')
+  
+  if [[ "$count" == "0" ]]; then
+    return
+  fi
+  
+  # Process each closed task
+  echo "$closed_tasks" | jq -c '.[]' | while read -r task; do
+    local task_title=$(echo "$task" | jq -r '.title')
+    local parent_id=$(echo "$task" | jq -r '.parent // empty')
+    
+    if [[ -z "$parent_id" ]]; then
+      continue
+    fi
+    
+    # Get change-id from epic title
+    local change_id=$(bd_cmd show "$parent_id" --json | jq -r '.title // empty')
+    if [[ -z "$change_id" ]]; then
+      continue
+    fi
+    
+    local tasks_file="openspec/changes/$change_id/tasks.md"
+    if [[ ! -f "$tasks_file" ]]; then
+      continue
+    fi
+    
+    # Escape special chars for sed
+    local escaped_title=$(echo "$task_title" | sed 's/[&/\]/\\&/g')
+    
+    # Update checkbox from [ ] or [-] to [x] for matching task
+    # Match lines like: - [ ] task title or - [-] task title
+    if grep -q "- \[ \] $escaped_title\|^- \[-\] $escaped_title" "$tasks_file" 2>/dev/null; then
+      sed -i.bak "s/- \[ \] $escaped_title/- [x] $escaped_title/g; s/- \[-\] $escaped_title/- [x] $escaped_title/g" "$tasks_file"
+      rm -f "$tasks_file.bak"
+    fi
+  done
+}
+
 # Output summary of all work done in this loop
 output_loop_summary() {
   echo "" >&2
@@ -130,6 +172,9 @@ if [[ "$STOP_HOOK_ACTIVE" == "true" ]]; then
 else
   jq '.stuck_count = 0' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
 fi
+
+# Sync completed tasks from Beads back to tasks.md files
+sync_completed_tasks
 
 # Get Beads status (with timeout)
 READY_TASKS=$(bd_cmd ready --json)
@@ -237,17 +282,13 @@ Steps:
 
 3. Implement the task, keeping changes minimal and focused.
 
-4. Update tasks.md to reflect progress:
-   - Mark task as in-progress: \`- [-]\`
-   - When done: \`- [x]\`
-
-5. Complete the task in Beads:
+4. Complete the task in Beads (tasks.md is auto-synced by the hook):
    \`\`\`bash
    bd close $TASK_ID --reason \"Completed: <brief summary>\"
    bd sync
    \`\`\`
 
-6. Commit your work:
+5. Commit your work:
    \`\`\`bash
    git add -A && git commit -m \"$CHANGE_ID: $TASK_ID - <brief summary>\"
    \`\`\`
