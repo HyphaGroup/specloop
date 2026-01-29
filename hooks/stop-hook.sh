@@ -5,6 +5,12 @@
 
 set -euo pipefail
 
+# Skip if explicitly disabled (for parallel spec-writing sessions)
+# Usage: OPENSPEC_LOOP_DISABLED=true droid
+if [[ "${OPENSPEC_LOOP_DISABLED:-}" == "true" ]]; then
+  exit 0
+fi
+
 # Read hook input from stdin
 HOOK_INPUT=$(cat)
 
