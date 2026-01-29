@@ -293,8 +293,9 @@ Steps:
    git add -A && git commit -m \"$CHANGE_ID: $TASK_ID - <brief summary>\"
    \`\`\`
 
-BLOCKED Status:
-If you cannot proceed due to a spec issue, output: BLOCKED: <reason>"
+IMPORTANT: Do NOT defer or skip tasks. Either:
+- Complete the task and close it in Beads
+- Or output BLOCKED: <reason> if you cannot proceed due to a spec issue"
 
 if [[ -n "$VERIFY_COMMANDS" ]]; then
   PROMPT="$PROMPT
